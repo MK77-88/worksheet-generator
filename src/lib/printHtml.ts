@@ -64,6 +64,54 @@ export function buildPrintableHtml(
 </div></body></html>`;
 }
 
+/**
+ * 구글독스에 "서식 그대로" 붙여넣기용 HTML.
+ * 구글독스는 붙여넣을 때 flex/grid 레이아웃과 웹폰트는 무시하지만
+ * <table>, <b>, 글자색, 배경색(하이라이트), 목록은 그대로 살려줍니다.
+ * 그래서 미리보기용 buildPrintableHtml과는 다른, 단순한 태그로 따로 만듭니다.
+ */
+export function buildDocsHtml(
+  results: ResultEntry[],
+  settings: Settings,
+  showAnswers: boolean,
+): string {
+  let body = '';
+  results.forEach(({ typeId, data }, ri) => {
+    const t = TYPES.find((x) => x.id === typeId)!;
+    if (ri > 0) body += `<p>&nbsp;</p><p style="border-top:1px dashed #ccc;">&nbsp;</p>`;
+    body += `<p><span style="font-size:9pt;color:${COLORS.red};font-weight:bold;letter-spacing:2px;">${esc(t.label.toUpperCase())}</span></p>`;
+    body += `<p><span style="font-size:17pt;font-weight:bold;">${esc(data.title)}</span></p>`;
+    if (data.subject) {
+      body += `<p><span style="font-size:10pt;color:${COLORS.sub};">${esc(data.subject)} · ${esc(settings.level)} · ${esc(settings.diff)}</span></p>`;
+    }
+    body += `<table style="border-collapse:collapse;margin:6px 0 14px;" cellpadding="6"><tr>
+      <td style="border:1px solid #ccc;text-align:center;">학번</td><td style="border:1px solid #ccc;text-align:center;">이름</td><td style="border:1px solid #ccc;text-align:center;">점수</td>
+    </tr><tr><td style="border:1px solid #ccc;">&nbsp;</td><td style="border:1px solid #ccc;">&nbsp;</td><td style="border:1px solid #ccc;">&nbsp;</td></tr></table>`;
+
+    (data.items || []).forEach((it) => {
+      body += `<p><span style="font-weight:bold;">${it.no}.</span> ${esc(it.question)}</p>`;
+      (it.choices || []).forEach((c) => {
+        body += `<p style="margin-left:18pt;">${esc(c)}</p>`;
+      });
+      if (it.source === 'web' && it.source_note) {
+        body += `<p><span style="font-size:9pt;color:${COLORS.blue};">※ 웹 출처: ${esc(it.source_note)}</span></p>`;
+      }
+      if (showAnswers && it.answer) {
+        body += `<p><span style="background-color:#FCF7F0;"><span style="color:${COLORS.red};font-weight:bold;">정답·해설</span> ${esc(it.answer)}</span></p>`;
+      }
+      body += `<p>&nbsp;</p>`;
+    });
+
+    if (data.sources?.length) {
+      body += `<p><span style="font-weight:bold;">참고 자료</span></p>`;
+      data.sources.forEach((s) => {
+        body += `<p>· ${esc(s.title)} ${s.url ? esc(s.url) : ''}</p>`;
+      });
+    }
+  });
+  return `<div>${body}</div>`;
+}
+
 export function buildPlainText(
   results: ResultEntry[],
   showAnswers: boolean,

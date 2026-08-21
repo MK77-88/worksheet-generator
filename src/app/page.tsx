@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { COLORS, TYPES, LEVELS, COUNTS, DIFFS, Settings, ResultEntry, TypeId } from '@/lib/constants';
 import { generateWorksheet } from '@/lib/generate';
-import { buildPrintableHtml, buildPlainText } from '@/lib/printHtml';
+import { buildPrintableHtml, buildDocsHtml, buildPlainText } from '@/lib/printHtml';
 
 /* ── 작은 UI 조각들 ── */
 const StepBadge = ({ n }: { n: string | number }) => (
@@ -52,6 +52,7 @@ export default function Home() {
   const [error, setError]       = useState('');
   const [showAnswers, setShowAnswers] = useState(true);
   const [copied, setCopied]     = useState(false);
+  const [richCopied, setRichCopied] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -117,7 +118,24 @@ export default function Home() {
 
   /* ── 내보내기 ── */
   const plainText = () => buildPlainText(results, showAnswers);
+  const docsHtml  = () => buildDocsHtml(results, settings, showAnswers);
 
+  // 1차: 서식(굵게·색상·표) 포함 복사 → 구글독스에 그대로 살아남음
+  const tryCopyRich = async (html: string, text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && typeof window.ClipboardItem !== 'undefined') {
+        const item = new ClipboardItem({
+          'text/html': new Blob([html], { type: 'text/html' }),
+          'text/plain': new Blob([text], { type: 'text/plain' }),
+        });
+        await navigator.clipboard.write([item]);
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+
+  // 2차: 서식 없는 텍스트만이라도 복사 (구형 브라우저 대응)
   const tryCopy = async (text: string): Promise<boolean> => {
     try { await navigator.clipboard.writeText(text); return true; } catch {}
     try {
@@ -133,6 +151,12 @@ export default function Home() {
 
   const copyAll = async () => {
     setError('');
+    const rich = await tryCopyRich(docsHtml(), plainText());
+    if (rich) {
+      setRichCopied(true); setCopied(true);
+      setTimeout(() => { setCopied(false); setRichCopied(false); }, 2500);
+      return;
+    }
     if (await tryCopy(plainText())) {
       setCopied(true); setTimeout(() => setCopied(false), 2000);
     } else {
@@ -142,8 +166,14 @@ export default function Home() {
 
   const openGoogleDocs = async () => {
     setError('');
-    const ok = await tryCopy(plainText());
-    if (ok) { setCopied(true); setTimeout(() => setCopied(false), 2500); }
+    const rich = await tryCopyRich(docsHtml(), plainText());
+    if (rich) {
+      setRichCopied(true); setCopied(true);
+      setTimeout(() => { setCopied(false); setRichCopied(false); }, 3000);
+    } else {
+      const ok = await tryCopy(plainText());
+      if (ok) { setCopied(true); setTimeout(() => setCopied(false), 2500); }
+    }
     setExportOpen(true);
   };
 
@@ -162,6 +192,7 @@ export default function Home() {
       setError("파일 저장에 실패했어요. '전체 복사'로 내용을 옮겨 주세요.");
     }
   };
+
 
   const handlePrint = () => window.print();
 
@@ -324,7 +355,7 @@ export default function Home() {
                   </button>
                   <button className="btn" onClick={copyAll}
                     style={{ padding: '8px 14px', borderRadius: 8, border: `1px solid ${COLORS.line}`, background: '#fff', fontSize: 13, fontWeight: 600 }}>
-                    {copied ? '복사됨 ✓' : '전체 복사'}
+                    {copied ? (richCopied ? '서식 포함 복사됨 ✓' : '복사됨 ✓') : '전체 복사 (서식 포함)'}
                   </button>
                   <button className="btn" onClick={downloadHtml}
                     style={{ padding: '8px 14px', borderRadius: 8, border: 'none', background: COLORS.ink, color: '#fff', fontSize: 13, fontWeight: 600 }}
@@ -438,16 +469,31 @@ export default function Home() {
                 style={{ border: 'none', background: 'transparent', fontSize: 20, lineHeight: 1 }}>✕</button>
             </div>
             <ol style={{ margin: 0, paddingLeft: 20, fontSize: 13.5, lineHeight: 1.8, color: COLORS.sub }}>
-              <li>{copied ? <span>내용이 <b style={{ color: COLORS.green }}>클립보드에 복사됐어요</b> — 바로 2번으로!</span> : <span>아래 <b>전체 선택 후 복사</b> 버튼을 누르세요</span>}</li>
+              <li>
+                {richCopied ? (
+                  <span>서식(굵게·색상·표) 포함해서 <b style={{ color: COLORS.green }}>클립보드에 복사됐어요</b> — 바로 2번으로!</span>
+                ) : copied ? (
+                  <span>내용이 <b style={{ color: COLORS.green }}>클립보드에 복사됐어요</b> (서식 없이 텍스트만) — 바로 2번으로!</span>
+                ) : (
+                  <span>아래 <b>전체 선택 후 복사</b> 버튼을 누르세요</span>
+                )}
+              </li>
               <li><a href="https://docs.new" target="_blank" rel="noreferrer" style={{ color: COLORS.blue, fontWeight: 700 }}>새 구글 문서 열기 ↗</a>를 누른 뒤</li>
               <li>빈 문서에 붙여넣기 (Ctrl+V) 하면 끝!</li>
             </ol>
             <textarea readOnly value={plainText()} onFocus={(e) => e.currentTarget.select()}
               style={{ flex: 1, minHeight: 200, width: '100%', border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, fontSize: 12.5, lineHeight: 1.6, fontFamily: 'inherit', resize: 'vertical', color: COLORS.ink }} />
+            <div style={{ fontSize: 11.5, color: COLORS.sub }}>
+              위 상자는 서식 없는 텍스트 미리보기예요. 서식까지 옮기려면 아래 &quot;서식 포함 복사&quot; 버튼을 쓰세요 (이 상자를 직접 복사하면 서식 없이 붙여넣어져요).
+            </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button className="btn" onClick={async () => { if (await tryCopy(plainText())) { setCopied(true); setTimeout(() => setCopied(false), 2500); } }}
+              <button className="btn" onClick={async () => {
+                  const rich = await tryCopyRich(docsHtml(), plainText());
+                  if (rich) { setRichCopied(true); setCopied(true); setTimeout(() => { setCopied(false); setRichCopied(false); }, 2500); return; }
+                  if (await tryCopy(plainText())) { setCopied(true); setTimeout(() => setCopied(false), 2500); }
+                }}
                 style={{ padding: '10px 16px', borderRadius: 8, border: 'none', background: COLORS.ink, color: '#fff', fontSize: 13, fontWeight: 600 }}>
-                {copied ? '복사됨 ✓' : '전체 선택 후 복사'}
+                {copied ? (richCopied ? '서식 포함 복사됨 ✓' : '복사됨 ✓') : '서식 포함 복사'}
               </button>
               <a href="https://docs.new" target="_blank" rel="noreferrer" className="btn"
                 style={{ padding: '10px 16px', borderRadius: 8, border: `1px solid ${COLORS.blue}`, background: COLORS.blueSoft, color: COLORS.blue, fontSize: 13, fontWeight: 600, textDecoration: 'none' }}>
