@@ -1,6 +1,7 @@
 import { TYPE_GUIDE, TYPES, Settings, WorksheetData, TypeId } from './constants';
 
 const BATCH_SIZE = 3;
+export const GEMINI_MODEL = 'gemini-2.5-flash'; // 무료 티어로 사용 가능
 
 function buildPrompt(
   typeId: TypeId,
@@ -75,7 +76,6 @@ function safeParseJson(raw: string): WorksheetData {
     if (direct) return direct;
   }
 
-  // 복구 모드
   let out = '';
   let inStr = false;
   let esc = false;
@@ -111,42 +111,76 @@ function safeParseJson(raw: string): WorksheetData {
   throw new Error('응답 형식을 복구하지 못했어요');
 }
 
-async function callApi(prompt: string, useWeb: boolean, pdfB64: string): Promise<string> {
-  const body: Record<string, unknown> = {
-    model: 'claude-sonnet-4-6',
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } },
-        { type: 'text', text: prompt },
-      ],
-    }],
-  };
-  if (useWeb) body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+interface GeminiPart { text?: string; inline_data?: { mime_type: string; data: string } }
 
-  // 배포된 서비스에서는 /api/generate 프록시를 경유해 API 키를 서버에서 관리
-  // 개발 로컬에서도 동일 경로 사용 (Next.js dev server가 처리)
-  const res = await fetch('/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+function buildGeminiBody(prompt: string, useWeb: boolean, pdfB64: string) {
+  const parts: GeminiPart[] = [
+    { inline_data: { mime_type: 'application/pdf', data: pdfB64 } },
+    { text: prompt },
+  ];
+  const body: Record<string, unknown> = {
+    contents: [{ parts }],
+    generationConfig: { maxOutputTokens: 4096, temperature: 0.4 },
+  };
+  // google_search 도구와 강제 JSON 응답 모드는 함께 쓰기 까다로워서
+  // 프롬프트로 JSON을 요청하고 safeParseJson으로 복구하는 방식을 유지
+  if (useWeb) body.tools = [{ google_search: {} }];
+  return body;
+}
+
+async function callGeminiDirect(apiKey: string, body: unknown): Promise<string> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+  );
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message || 'API 오류');
-  return (data.content || [])
-    .filter((b: { type: string }) => b.type === 'text')
-    .map((b: { text: string }) => b.text)
+  if (data.error) throw new Error(data.error.message || 'Gemini API 오류');
+  const cand = data.candidates?.[0];
+  if (!cand) throw new Error('응답이 비어 있어요 (안전 필터에 걸렸을 수 있어요)');
+  return (cand.content?.parts || [])
+    .map((p: GeminiPart) => p.text || '')
     .join('\n');
 }
 
+async function callGeminiViaProxy(apiKey: string, body: unknown): Promise<string> {
+  // 브라우저에서 구글로 직접 호출이 막힌 네트워크 환경을 위한 대체 경로.
+  // 우리 서버는 키를 저장하지 않고 그대로 전달만 함.
+  const res = await fetch('/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey, model: GEMINI_MODEL, payload: body }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || 'Gemini API 오류');
+  const cand = data.candidates?.[0];
+  if (!cand) throw new Error('응답이 비어 있어요 (안전 필터에 걸렸을 수 있어요)');
+  return (cand.content?.parts || [])
+    .map((p: GeminiPart) => p.text || '')
+    .join('\n');
+}
+
+async function callApi(apiKey: string, prompt: string, useWeb: boolean, pdfB64: string): Promise<string> {
+  const body = buildGeminiBody(prompt, useWeb, pdfB64);
+  try {
+    return await callGeminiDirect(apiKey, body);
+  } catch (e) {
+    // 네트워크/CORS 문제로 직접 호출이 실패한 경우에만 프록시로 재시도
+    if (e instanceof TypeError) {
+      return await callGeminiViaProxy(apiKey, body);
+    }
+    throw e;
+  }
+}
+
 export async function generateWorksheet(
+  apiKey: string,
   typeId: TypeId,
   settings: Settings,
   useWeb: boolean,
   pdfB64: string,
   onBatch?: (start: number, end: number, total: number) => void,
 ): Promise<WorksheetData> {
+  if (!apiKey) throw new Error('Gemini API 키를 먼저 입력해 주세요');
   const total = parseInt(settings.count, 10) || 5;
   const merged: WorksheetData = { title: '', subject: '', items: [], sources: [] };
   const prevQuestions: string[] = [];
@@ -160,7 +194,7 @@ export async function generateWorksheet(
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const text = await callApi(prompt, useWeb, pdfB64);
+        const text = await callApi(apiKey, prompt, useWeb, pdfB64);
         parsed = safeParseJson(text);
         break;
       } catch (e) { lastErr = e as Error; }

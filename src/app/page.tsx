@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { COLORS, TYPES, LEVELS, COUNTS, DIFFS, Settings, ResultEntry, TypeId } from '@/lib/constants';
 import { generateWorksheet } from '@/lib/generate';
 import { buildPrintableHtml, buildPlainText } from '@/lib/printHtml';
@@ -38,6 +38,8 @@ const kindLabel: Record<string, string> = {
 
 /* ── 메인 컴포넌트 ── */
 export default function Home() {
+  const [apiKey, setApiKey]     = useState('');
+  const [keyReady, setKeyReady] = useState(false); // localStorage 읽기 완료 여부 (SSR 깜빡임 방지)
   const [file, setFile]         = useState<File | null>(null);
   const [pdfB64, setPdfB64]     = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -52,6 +54,19 @@ export default function Home() {
   const [copied, setCopied]     = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  /* ── API 키: 브라우저(localStorage)에만 저장, 서버로는 절대 안 감 ── */
+  useEffect(() => {
+    const saved = window.localStorage.getItem('gemini_api_key');
+    if (saved) setApiKey(saved);
+    setKeyReady(true);
+  }, []);
+
+  const updateApiKey = (v: string) => {
+    setApiKey(v);
+    if (v) window.localStorage.setItem('gemini_api_key', v);
+    else window.localStorage.removeItem('gemini_api_key');
+  };
 
   /* ── 파일 처리 ── */
   const onFile = useCallback((f: File | null | undefined) => {
@@ -71,6 +86,7 @@ export default function Home() {
 
   /* ── 생성 ── */
   const generate = async () => {
+    if (!apiKey) { setError('먼저 Gemini API 키를 입력해 주세요.'); return; }
     if (!pdfB64) { setError('먼저 교과서 PDF를 올려주세요.'); return; }
     if (selected.length === 0) { setError('활동지 유형을 하나 이상 선택해 주세요.'); return; }
     setBusy(true); setError(''); setResults([]);
@@ -79,6 +95,7 @@ export default function Home() {
       for (let i = 0; i < selected.length; i++) {
         const t = TYPES.find((x) => x.id === selected[i])!;
         const data = await generateWorksheet(
+          apiKey,
           selected[i],
           settings,
           useWeb,
@@ -165,6 +182,30 @@ export default function Home() {
 
           {/* ── 왼쪽: 설정 패널 ── */}
           <section className="no-print" style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+
+            {/* 0. API 키 */}
+            <div>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 }}>
+                <StepBadge n="0" /><strong style={{ fontSize: 15 }}>Gemini API 키</strong>
+                <span style={{ fontSize: 12, color: COLORS.sub }}>무료 · 내 브라우저에만 저장됨</span>
+              </div>
+              <div style={{ background: '#fff', border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  placeholder="AIza... 로 시작하는 키를 붙여넣으세요"
+                  value={apiKey}
+                  onChange={(e) => updateApiKey(e.target.value)}
+                  style={sel}
+                />
+                <div style={{ fontSize: 12, color: COLORS.sub, lineHeight: 1.6 }}>
+                  이 키는 서버에 저장되지 않고 <b>이 브라우저에만</b> 남아요. 다른 선생님이 접속하면 각자 자기 키를 넣어서 쓰면 됩니다.{' '}
+                  <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" style={{ color: COLORS.blue, fontWeight: 600 }}>
+                    무료 키 발급받기 ↗
+                  </a>
+                </div>
+              </div>
+            </div>
 
             {/* 1. 업로드 */}
             <div>
