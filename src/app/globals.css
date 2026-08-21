@@ -1,0 +1,43 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #FAFAF6; }
+
+.ws-grid {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 28px;
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .ws-grid { grid-template-columns: 1fr; }
+}
+
+.chip { transition: all .15s ease; cursor: pointer; }
+.chip:hover { border-color: #1E222B !important; }
+.chip:focus-visible { outline: 2px solid #2C4E86; outline-offset: 2px; }
+
+.btn { transition: transform .1s ease, opacity .15s ease; cursor: pointer; }
+.btn:hover { opacity: .92; }
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible { outline: 2px solid #2C4E86; outline-offset: 2px; }
+
+.drop { transition: all .15s ease; }
+
+input::placeholder { color: #A9ADB8; }
+
+@keyframes pulse { 0%,100% { opacity:.45 } 50% { opacity:1 } }
+.pulse { animation: pulse 1.4s ease infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse { animation: none; }
+  .btn, .chip, .drop { transition: none; }
+}
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+  #sheet-area {
+    box-shadow: none !important;
+    margin: 0 !important;
+    max-width: none !important;
+  }
+}
