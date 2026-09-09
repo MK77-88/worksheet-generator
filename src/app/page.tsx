@@ -201,11 +201,14 @@ export default function Home() {
     <div style={{ minHeight: '100vh', background: COLORS.paper, color: COLORS.ink, fontFamily: "'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif" }}>
 
       {/* 상단 헤더 */}
-      <header className="no-print" style={{ borderBottom: `1px solid ${COLORS.line}`, background: '#fff', padding: '18px 28px', display: 'flex', alignItems: 'baseline', gap: 14 }}>
-        <h1 style={{ margin: 0, fontFamily: "'Noto Serif KR',serif", fontWeight: 800, fontSize: 22, letterSpacing: '-0.01em' }}>
-          활동지 생성기
-        </h1>
-        <span style={{ fontSize: 13, color: COLORS.sub }}>교과서 PDF 한 권이면, 수업 자료가 인쇄실에서 나옵니다</span>
+      <header className="no-print" style={{ borderBottom: `1px solid ${COLORS.line}`, background: '#fff', padding: '18px 28px', display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 14 }}>
+          <h1 style={{ margin: 0, fontFamily: "'Noto Serif KR',serif", fontWeight: 800, fontSize: 22, letterSpacing: '-0.01em' }}>
+            활동지 생성기
+          </h1>
+          <span style={{ fontSize: 13, color: COLORS.sub }}>교과서 PDF 한 권이면, 수업 자료가 인쇄실에서 나옵니다</span>
+        </div>
+        <span style={{ fontSize: 12, color: COLORS.sub, whiteSpace: 'nowrap' }}>Made by 홍천고 김민영</span>
       </header>
 
       <main style={{ maxWidth: 1200, margin: '0 auto', padding: '28px 20px 60px' }}>

@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: '활동지 생성기',
-  description: '교과서 PDF를 올리면 AI가 활동지를 만들어 드립니다',
+  description: '교과서 PDF를 올리면 AI가 활동지를 만들어 드립니다 · Made by 홍천고 김민영',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
