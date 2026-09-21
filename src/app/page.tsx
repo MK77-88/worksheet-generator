@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { COLORS, TYPES, LEVELS, COUNTS, DIFFS, Settings, ResultEntry, TypeId } from '@/lib/constants';
-import { generateWorksheet } from '@/lib/generate';
+import { generateWorksheet, uploadFileToGemini, PdfRef } from '@/lib/generate';
 import { buildPrintableHtml, buildDocsHtml, buildPlainText } from '@/lib/printHtml';
 
 /* ── 작은 UI 조각들 ── */
@@ -40,8 +40,7 @@ const kindLabel: Record<string, string> = {
 export default function Home() {
   const [apiKey, setApiKey]     = useState('');
   const [keyReady, setKeyReady] = useState(false); // localStorage 읽기 완료 여부 (SSR 깜빡임 방지)
-  const [file, setFile]         = useState<File | null>(null);
-  const [pdfB64, setPdfB64]     = useState<string | null>(null);
+  const [files, setFiles]       = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [selected, setSelected] = useState<TypeId[]>(['formative', 'concept']);
   const [settings, setSettings] = useState<Settings>({ level: '고등학교', count: '5문항', diff: '기본 위주', note: '' });
@@ -56,6 +55,9 @@ export default function Home() {
   const [exportOpen, setExportOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // 업로드된 파일을 Gemini Files API 참조로 캐싱 (같은 탭에서는 재업로드 없이 재사용)
+  const fileRefCache = useRef<Map<File, PdfRef>>(new Map());
+
   /* ── API 키: 브라우저(localStorage)에만 저장, 서버로는 절대 안 감 ── */
   useEffect(() => {
     const saved = window.localStorage.getItem('gemini_api_key');
@@ -69,30 +71,61 @@ export default function Home() {
     else window.localStorage.removeItem('gemini_api_key');
   };
 
-  /* ── 파일 처리 ── */
-  const onFile = useCallback((f: File | null | undefined) => {
+  /* ── 파일 처리 (여러 개 업로드 가능: 교과서 + 심화자료 + 기출문제 + 해설서 등) ── */
+  const MAX_FILES = 45;
+
+  const onFiles = useCallback((list: FileList | File[] | null | undefined) => {
     setError('');
-    if (!f) return;
-    if (f.type !== 'application/pdf') { setError('PDF 파일만 업로드할 수 있어요.'); return; }
-    if (f.size > 30 * 1024 * 1024) { setError('파일이 30MB를 넘어요. 필요한 단원만 잘라서 올려주세요.'); return; }
-    setFile(f);
-    const r = new FileReader();
-    r.onload = () => setPdfB64(String(r.result).split(',')[1]);
-    r.onerror = () => setError('파일을 읽지 못했어요. 다시 시도해 주세요.');
-    r.readAsDataURL(f);
+    if (!list || list.length === 0) return;
+    const incoming = Array.from(list);
+    const bad = incoming.find((f) => f.type !== 'application/pdf');
+    if (bad) { setError(`PDF 파일만 업로드할 수 있어요 (${bad.name}).`); return; }
+    const tooBig = incoming.find((f) => f.size > 30 * 1024 * 1024);
+    if (tooBig) { setError(`${tooBig.name} 파일이 30MB를 넘어요. 필요한 부분만 잘라서 올려주세요.`); return; }
+
+    setFiles((prev) => {
+      const merged = [...prev, ...incoming].slice(0, MAX_FILES);
+      if (prev.length + incoming.length > MAX_FILES) {
+        setError(`한 번에 최대 ${MAX_FILES}개까지 올릴 수 있어요.`);
+      }
+      return merged;
+    });
   }, []);
+
+  const removeFile = (idx: number) => {
+    setFiles((prev) => {
+      const removed = prev[idx];
+      if (removed) fileRefCache.current.delete(removed);
+      return prev.filter((_, i) => i !== idx);
+    });
+  };
 
   const toggleType = (id: TypeId) =>
     setSelected((s) => s.includes(id) ? s.filter((x) => x !== id) : [...s, id]);
 
+  /* 첨부된 파일들을 Gemini Files API에 업로드(캐시에 없는 것만) 하고 참조 목록을 반환.
+     파일이 크거나 많을수록(예: 교육과정 41종) 여기서 시간이 걸리지만,
+     한 번 올려두면 이 탭에서는 유형×배치를 아무리 돌려도 재전송하지 않는다. */
+  const ensureUploaded = async (): Promise<PdfRef[]> => {
+    const need = files.filter((f) => !fileRefCache.current.has(f));
+    for (let i = 0; i < need.length; i++) {
+      const f = need[i];
+      setProgress(`자료 업로드 중… (${i + 1}/${need.length}) ${f.name}`);
+      const ref = await uploadFileToGemini(apiKey, f, (msg) => setProgress(msg));
+      fileRefCache.current.set(f, ref);
+    }
+    return files.map((f) => fileRefCache.current.get(f)!);
+  };
+
   /* ── 생성 ── */
   const generate = async () => {
     if (!apiKey) { setError('먼저 Gemini API 키를 입력해 주세요.'); return; }
-    if (!pdfB64) { setError('먼저 교과서 PDF를 올려주세요.'); return; }
+    if (files.length === 0) { setError('먼저 교과서 PDF를 올려주세요.'); return; }
     if (selected.length === 0) { setError('활동지 유형을 하나 이상 선택해 주세요.'); return; }
     setBusy(true); setError(''); setResults([]);
     const out: ResultEntry[] = [];
     try {
+      const pdfRefs = await ensureUploaded();
       for (let i = 0; i < selected.length; i++) {
         const t = TYPES.find((x) => x.id === selected[i])!;
         const data = await generateWorksheet(
@@ -100,7 +133,7 @@ export default function Home() {
           selected[i],
           settings,
           useWeb,
-          pdfB64,
+          pdfRefs,
           (s, e, total) =>
             setProgress(`${t.label} (${i + 1}/${selected.length}) — ${s}~${e}번 문항 생성 중 (전체 ${total}문항)`),
         );
@@ -244,30 +277,50 @@ export default function Home() {
             {/* 1. 업로드 */}
             <div>
               <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 }}>
-                <StepBadge n="1" /><strong style={{ fontSize: 15 }}>교과서 PDF 업로드</strong>
+                <StepBadge n="1" /><strong style={{ fontSize: 15 }}>자료 업로드</strong>
+                <span style={{ fontSize: 12, color: COLORS.sub }}>교과서 + 심화자료·해설서 등, 최대 {MAX_FILES}개</span>
               </div>
-              <div className="drop" role="button" tabIndex={0}
-                onClick={() => inputRef.current?.click()}
-                onKeyDown={(e) => e.key === 'Enter' && inputRef.current?.click()}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={(e) => { e.preventDefault(); setDragOver(false); onFile(e.dataTransfer.files?.[0]); }}
-                style={{ border: `1.5px dashed ${dragOver ? COLORS.red : '#C9C8C0'}`, background: dragOver ? COLORS.redSoft : '#fff', borderRadius: 12, padding: '26px 18px', textAlign: 'center', cursor: 'pointer' }}
-              >
-                <input ref={inputRef} type="file" accept="application/pdf" style={{ display: 'none' }} onChange={(e) => onFile(e.target.files?.[0])} />
-                {file ? (
+
+              {files.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
+                  {files.map((f, idx) => (
+                    <div key={`${f.name}-${idx}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, background: '#fff', border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: '8px 10px' }}>
+                      <span style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        📄 {f.name} <span style={{ color: COLORS.sub, fontSize: 11.5 }}>· {(f.size / 1024 / 1024).toFixed(1)}MB</span>
+                      </span>
+                      <button className="btn" onClick={() => removeFile(idx)} aria-label={`${f.name} 제거`}
+                        style={{ border: 'none', background: 'transparent', color: COLORS.sub, fontSize: 15, lineHeight: 1, flexShrink: 0 }}>✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {files.length < MAX_FILES && (
+                <div className="drop" role="button" tabIndex={0}
+                  onClick={() => inputRef.current?.click()}
+                  onKeyDown={(e) => e.key === 'Enter' && inputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={(e) => { e.preventDefault(); setDragOver(false); onFiles(e.dataTransfer.files); }}
+                  style={{ border: `1.5px dashed ${dragOver ? COLORS.red : '#C9C8C0'}`, background: dragOver ? COLORS.redSoft : '#fff', borderRadius: 12, padding: '22px 18px', textAlign: 'center', cursor: 'pointer' }}
+                >
+                  <input ref={inputRef} type="file" accept="application/pdf" multiple style={{ display: 'none' }} onChange={(e) => onFiles(e.target.files)} />
                   <div>
-                    <div style={{ fontWeight: 700, fontSize: 14 }}>📄 {file.name}</div>
-                    <div style={{ fontSize: 12, color: COLORS.sub, marginTop: 4 }}>{(file.size / 1024 / 1024).toFixed(1)}MB · 클릭해서 다른 파일로 교체</div>
+                    <div style={{ fontSize: 22, marginBottom: 4 }}>⤒</div>
+                    <div style={{ fontSize: 14, fontWeight: 500 }}>
+                      {files.length === 0 ? 'PDF를 끌어다 놓거나 클릭해서 선택' : 'PDF 추가하기'}
+                    </div>
+                    <div style={{ fontSize: 12, color: COLORS.sub, marginTop: 4 }}>
+                      파일당 최대 30MB · 심화자료·기출문제·해설서를 같이 올리면 더 깊이있는 문항이 나와요
+                    </div>
                   </div>
-                ) : (
-                  <div>
-                    <div style={{ fontSize: 26, marginBottom: 6 }}>⤒</div>
-                    <div style={{ fontSize: 14, fontWeight: 500 }}>PDF를 끌어다 놓거나 클릭해서 선택</div>
-                    <div style={{ fontSize: 12, color: COLORS.sub, marginTop: 4 }}>최대 30MB · 필요한 단원만 올리면 더 정확해요</div>
-                  </div>
-                )}
-              </div>
+                </div>
+              )}
+              {files.length > 5 && (
+                <div style={{ fontSize: 11.5, color: COLORS.sub, marginTop: 6, lineHeight: 1.5 }}>
+                  파일이 많으면 처음 활동지를 만들 때 업로드에 시간이 좀 걸려요. 같은 탭에서는 이후 다시 올리지 않고 재사용돼요 (탭을 닫거나 새로고침하면 다시 올려야 해요).
+                </div>
+              )}
             </div>
 
             {/* 2. 유형 */}

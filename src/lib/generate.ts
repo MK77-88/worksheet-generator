@@ -3,6 +3,73 @@ import { TYPE_GUIDE, TYPES, Settings, WorksheetData, TypeId } from './constants'
 const BATCH_SIZE = 3;
 export const GEMINI_MODEL = 'gemini-2.5-flash'; // 무료 티어로 사용 가능
 
+/** 첨부 자료 하나를 가리키는 참조.
+ * - inline: 작은 파일 하나만 있을 때, 바로 base64로 요청에 실어 보냄
+ * - file: Gemini Files API에 미리 업로드해두고 file_uri로 재사용 (대용량·다중 파일용, 48시간 보관)
+ */
+export type PdfRef =
+  | { mode: 'inline'; data: string }
+  | { mode: 'file'; uri: string; mimeType: string };
+
+/** 로컬 File을 Gemini Files API에 업로드하고 참조(uri)를 반환.
+ * resumable 업로드 프로토콜: 1) 메타데이터로 세션 시작 → 업로드 URL 획득
+ * 2) 그 URL로 실제 바이트 전송 → 파일 리소스(uri, state) 획득
+ * 3) state가 PROCESSING이면 ACTIVE가 될 때까지 잠깐 폴링
+ */
+export async function uploadFileToGemini(
+  apiKey: string,
+  file: File,
+  onStatus?: (msg: string) => void,
+): Promise<PdfRef> {
+  const mimeType = file.type || 'application/pdf';
+  const startRes = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(file.size),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { display_name: file.name } }),
+    },
+  );
+  if (!startRes.ok) throw new Error(`${file.name} 업로드 시작 실패`);
+  const uploadUrl = startRes.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error(`${file.name} 업로드 URL을 받지 못했어요`);
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(file.size),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: file,
+  });
+  const info = await uploadRes.json();
+  if (info.error) throw new Error(info.error.message || `${file.name} 업로드 실패`);
+  let fileResource = info.file;
+  if (!fileResource?.uri) throw new Error(`${file.name} 업로드 응답이 올바르지 않아요`);
+
+  // 큰 파일은 잠시 PROCESSING 상태일 수 있어 ACTIVE가 될 때까지 대기
+  let tries = 0;
+  while (fileResource.state === 'PROCESSING' && tries < 15) {
+    onStatus?.(`${file.name} 처리 중…`);
+    await new Promise((r) => setTimeout(r, 2000));
+    const checkRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${fileResource.name}?key=${encodeURIComponent(apiKey)}`,
+    );
+    fileResource = await checkRes.json();
+    tries++;
+  }
+  if (fileResource.state === 'FAILED') throw new Error(`${file.name} 처리에 실패했어요`);
+
+  return { mode: 'file', uri: fileResource.uri, mimeType: fileResource.mimeType || mimeType };
+}
+
 function buildPrompt(
   typeId: TypeId,
   settings: Settings,
@@ -10,9 +77,11 @@ function buildPrompt(
   startNo: number,
   endNo: number,
   prevQuestions: string[],
+  fileCount: number,
 ): string {
   const t = TYPES.find((x) => x.id === typeId)!;
-  return `당신은 한국 ${settings.level} 교사를 돕는 활동지 출제 전문가입니다. 첨부된 교과서 PDF를 근거로 활동지를 만드세요.
+  const docRef = fileCount > 1 ? `첨부된 자료 ${fileCount}개(교과서·심화자료·해설서 등)` : '첨부된 교과서 PDF';
+  return `당신은 한국 ${settings.level} 교사를 돕는 활동지 출제 전문가입니다. ${docRef}를 근거로 활동지를 만드세요.
 
 [활동지 유형] ${t.label}
 ${TYPE_GUIDE[typeId]}
@@ -30,12 +99,13 @@ ${
 [조건]
 - 학교급: ${settings.level}, 난이도: ${settings.diff}
 ${settings.note ? `- 특이사항: ${settings.note}` : ''}
+${fileCount > 1 ? '- 심화 위주로 요청된 경우, 첨부된 심화자료·기출문제 성격의 파일 내용을 적극 활용해 난이도를 끌어올리세요. 기본 교과서에만 있는 내용으로 심화 문항을 억지로 만들지 마세요.' : ''}
 
 [절대 규칙 — 할루시네이션 금지]
-1. 모든 문항의 사실적 내용은 첨부된 PDF에 실제로 등장하는 내용에 근거해야 합니다.
-2. ${useWeb ? '웹 검색으로 보강할 수 있으나, 검색 결과에서 직접 확인한 사실만 사용하고 해당 문항의 source를 "web"으로 표시하며 source_note에 출처명을 적으세요.' : 'PDF 밖의 외부 지식을 추가하지 마세요.'}
+1. 모든 문항의 사실적 내용은 ${docRef}에 실제로 등장하는 내용에 근거해야 합니다.
+2. ${useWeb ? '웹 검색으로 보강할 수 있으나, 검색 결과에서 직접 확인한 사실만 사용하고 해당 문항의 source를 "web"으로 표시하며 source_note에 출처명을 적으세요.' : '첨부 자료 밖의 외부 지식을 추가하지 마세요.'}
 3. 확실하지 않은 내용은 문항에서 제외하세요. 추측으로 채우지 마세요.
-4. 인명, 연도, 수치는 PDF${useWeb ? ' 또는 검색 결과' : ''}에서 확인된 것만 사용하세요.
+4. 인명, 연도, 수치는 첨부 자료${useWeb ? ' 또는 검색 결과' : ''}에서 확인된 것만 사용하세요.
 
 [출력 형식 — 매우 중요]
 - 아래 JSON만 출력하세요. 마크다운 코드펜스, 인사말, 설명 등 다른 텍스트를 절대 포함하지 마세요.
@@ -111,13 +181,19 @@ function safeParseJson(raw: string): WorksheetData {
   throw new Error('응답 형식을 복구하지 못했어요');
 }
 
-interface GeminiPart { text?: string; inline_data?: { mime_type: string; data: string } }
+interface GeminiPart {
+  text?: string;
+  inline_data?: { mime_type: string; data: string };
+  file_data?: { mime_type: string; file_uri: string };
+}
 
-function buildGeminiBody(prompt: string, useWeb: boolean, pdfB64: string) {
-  const parts: GeminiPart[] = [
-    { inline_data: { mime_type: 'application/pdf', data: pdfB64 } },
-    { text: prompt },
-  ];
+function buildGeminiBody(prompt: string, useWeb: boolean, pdfRefs: PdfRef[]) {
+  const docParts: GeminiPart[] = pdfRefs.map((ref) =>
+    ref.mode === 'inline'
+      ? { inline_data: { mime_type: 'application/pdf', data: ref.data } }
+      : { file_data: { mime_type: ref.mimeType, file_uri: ref.uri } },
+  );
+  const parts: GeminiPart[] = [...docParts, { text: prompt }];
   const body: Record<string, unknown> = {
     contents: [{ parts }],
     generationConfig: { maxOutputTokens: 4096, temperature: 0.4 },
@@ -159,8 +235,8 @@ async function callGeminiViaProxy(apiKey: string, body: unknown): Promise<string
     .join('\n');
 }
 
-async function callApi(apiKey: string, prompt: string, useWeb: boolean, pdfB64: string): Promise<string> {
-  const body = buildGeminiBody(prompt, useWeb, pdfB64);
+async function callApi(apiKey: string, prompt: string, useWeb: boolean, pdfRefs: PdfRef[]): Promise<string> {
+  const body = buildGeminiBody(prompt, useWeb, pdfRefs);
   try {
     return await callGeminiDirect(apiKey, body);
   } catch (e) {
@@ -177,10 +253,11 @@ export async function generateWorksheet(
   typeId: TypeId,
   settings: Settings,
   useWeb: boolean,
-  pdfB64: string,
+  pdfRefs: PdfRef[],
   onBatch?: (start: number, end: number, total: number) => void,
 ): Promise<WorksheetData> {
   if (!apiKey) throw new Error('Gemini API 키를 먼저 입력해 주세요');
+  if (pdfRefs.length === 0) throw new Error('PDF를 먼저 업로드해 주세요');
   const total = parseInt(settings.count, 10) || 5;
   const merged: WorksheetData = { title: '', subject: '', items: [], sources: [] };
   const prevQuestions: string[] = [];
@@ -188,13 +265,13 @@ export async function generateWorksheet(
   for (let start = 1; start <= total; start += BATCH_SIZE) {
     const end = Math.min(start + BATCH_SIZE - 1, total);
     onBatch?.(start, end, total);
-    const prompt = buildPrompt(typeId, settings, useWeb, start, end, prevQuestions);
+    const prompt = buildPrompt(typeId, settings, useWeb, start, end, prevQuestions, pdfRefs.length);
 
     let parsed: WorksheetData | null = null;
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const text = await callApi(apiKey, prompt, useWeb, pdfB64);
+        const text = await callApi(apiKey, prompt, useWeb, pdfRefs);
         parsed = safeParseJson(text);
         break;
       } catch (e) { lastErr = e as Error; }
