@@ -70,6 +70,21 @@ export async function uploadFileToGemini(
   return { mode: 'file', uri: fileResource.uri, mimeType: fileResource.mimeType || mimeType };
 }
 
+/** 사이트에 내장된 참고자료(예: /reference-docs/xxx.pdf)를 가져와서
+ * 같은 uploadFileToGemini 경로로 업로드. 같은 출처(same-origin)라 CORS 문제 없음. */
+export async function uploadReferenceDocToGemini(
+  apiKey: string,
+  publicPath: string,
+  displayName: string,
+  onStatus?: (msg: string) => void,
+): Promise<PdfRef> {
+  const res = await fetch(publicPath);
+  if (!res.ok) throw new Error(`${displayName}을(를) 불러오지 못했어요`);
+  const blob = await res.blob();
+  const file = new File([blob], displayName, { type: 'application/pdf' });
+  return uploadFileToGemini(apiKey, file, onStatus);
+}
+
 function buildPrompt(
   typeId: TypeId,
   settings: Settings,
@@ -77,10 +92,22 @@ function buildPrompt(
   startNo: number,
   endNo: number,
   prevQuestions: string[],
-  fileCount: number,
+  ownCount: number,
+  curriculumCount: number,
 ): string {
   const t = TYPES.find((x) => x.id === typeId)!;
-  const docRef = fileCount > 1 ? `첨부된 자료 ${fileCount}개(교과서·심화자료·해설서 등)` : '첨부된 교과서 PDF';
+  const fileCount = ownCount + curriculumCount;
+  let docRef: string;
+  let curriculumNote = '';
+  if (curriculumCount > 0 && ownCount > 0) {
+    docRef = `첨부된 자료(선생님이 올린 교과서·심화자료 ${ownCount}개 + 2022 개정 국가 교육과정 문서 ${curriculumCount}개)`;
+    curriculumNote = `- 국가 교육과정 문서(총론·교과별 교육과정)는 성취기준·역량·난이도 방향을 참고하는 용도로 쓰고, 문항의 구체적 소재는 되도록 선생님이 올린 교과서·심화자료에서 가져오세요. 교육과정 문서에만 있고 교과서에 없는 지엽적 예시를 억지로 문항화하지 마세요.\n`;
+  } else if (curriculumCount > 0) {
+    docRef = `첨부된 2022 개정 국가 교육과정 문서 ${curriculumCount}개`;
+    curriculumNote = `- 별도 교과서가 없으니, 해당 교과의 성취기준과 내용 체계를 근거로 문항을 구성하세요.\n`;
+  } else {
+    docRef = fileCount > 1 ? `첨부된 자료 ${fileCount}개(교과서·심화자료·해설서 등)` : '첨부된 교과서 PDF';
+  }
   return `당신은 한국 ${settings.level} 교사를 돕는 활동지 출제 전문가입니다. ${docRef}를 근거로 활동지를 만드세요.
 
 [활동지 유형] ${t.label}
@@ -99,8 +126,7 @@ ${
 [조건]
 - 학교급: ${settings.level}, 난이도: ${settings.diff}
 ${settings.note ? `- 특이사항: ${settings.note}` : ''}
-${fileCount > 1 ? '- 심화 위주로 요청된 경우, 첨부된 심화자료·기출문제 성격의 파일 내용을 적극 활용해 난이도를 끌어올리세요. 기본 교과서에만 있는 내용으로 심화 문항을 억지로 만들지 마세요.' : ''}
-
+${curriculumNote}${ownCount > 1 ? '- 심화 위주로 요청된 경우, 첨부된 심화자료·기출문제 성격의 파일 내용을 적극 활용해 난이도를 끌어올리세요. 기본 교과서에만 있는 내용으로 심화 문항을 억지로 만들지 마세요.\n' : ''}
 [절대 규칙 — 할루시네이션 금지]
 1. 모든 문항의 사실적 내용은 ${docRef}에 실제로 등장하는 내용에 근거해야 합니다.
 2. ${useWeb ? '웹 검색으로 보강할 수 있으나, 검색 결과에서 직접 확인한 사실만 사용하고 해당 문항의 source를 "web"으로 표시하며 source_note에 출처명을 적으세요.' : '첨부 자료 밖의 외부 지식을 추가하지 마세요.'}
@@ -255,9 +281,11 @@ export async function generateWorksheet(
   useWeb: boolean,
   pdfRefs: PdfRef[],
   onBatch?: (start: number, end: number, total: number) => void,
+  curriculumCount: number = 0,
 ): Promise<WorksheetData> {
   if (!apiKey) throw new Error('Gemini API 키를 먼저 입력해 주세요');
   if (pdfRefs.length === 0) throw new Error('PDF를 먼저 업로드해 주세요');
+  const ownCount = pdfRefs.length - curriculumCount;
   const total = parseInt(settings.count, 10) || 5;
   const merged: WorksheetData = { title: '', subject: '', items: [], sources: [] };
   const prevQuestions: string[] = [];
@@ -265,7 +293,7 @@ export async function generateWorksheet(
   for (let start = 1; start <= total; start += BATCH_SIZE) {
     const end = Math.min(start + BATCH_SIZE - 1, total);
     onBatch?.(start, end, total);
-    const prompt = buildPrompt(typeId, settings, useWeb, start, end, prevQuestions, pdfRefs.length);
+    const prompt = buildPrompt(typeId, settings, useWeb, start, end, prevQuestions, ownCount, curriculumCount);
 
     let parsed: WorksheetData | null = null;
     let lastErr: Error | null = null;

@@ -2,7 +2,9 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { COLORS, TYPES, LEVELS, COUNTS, DIFFS, Settings, ResultEntry, TypeId } from '@/lib/constants';
-import { generateWorksheet, uploadFileToGemini, PdfRef } from '@/lib/generate';
+import { generateWorksheet, uploadFileToGemini, uploadReferenceDocToGemini, PdfRef } from '@/lib/generate';
+import { REFERENCE_DOCS, referenceDocUrl } from '@/lib/referenceDocs';
+import { loadRefCache, saveRefCache, CachedRefEntry } from '@/lib/refCache';
 import { buildPrintableHtml, buildDocsHtml, buildPlainText } from '@/lib/printHtml';
 
 /* ── 작은 UI 조각들 ── */
@@ -45,6 +47,7 @@ export default function Home() {
   const [selected, setSelected] = useState<TypeId[]>(['formative', 'concept']);
   const [settings, setSettings] = useState<Settings>({ level: '고등학교', count: '5문항', diff: '기본 위주', note: '' });
   const [useWeb, setUseWeb]     = useState(true);
+  const [useCurriculum, setUseCurriculum] = useState(false);
   const [busy, setBusy]         = useState(false);
   const [progress, setProgress] = useState('');
   const [results, setResults]   = useState<ResultEntry[]>([]);
@@ -57,16 +60,41 @@ export default function Home() {
 
   // 업로드된 파일을 Gemini Files API 참조로 캐싱 (같은 탭에서는 재업로드 없이 재사용)
   const fileRefCache = useRef<Map<File, PdfRef>>(new Map());
+  // 내장 교육과정 자료용. 브라우저를 닫았다 열어도 48시간 안이면 재사용하도록 localStorage와 동기화
+  const referenceRefCache = useRef<Map<string, { ref: PdfRef; uploadedAt: number }>>(new Map());
+
+  const hydrateReferenceCache = (key: string) => {
+    referenceRefCache.current.clear();
+    if (!key) return;
+    const cached = loadRefCache(key);
+    Object.entries(cached).forEach(([file, entry]) => {
+      referenceRefCache.current.set(file, {
+        ref: { mode: 'file', uri: entry.uri, mimeType: entry.mimeType },
+        uploadedAt: entry.uploadedAt,
+      });
+    });
+  };
+
+  const persistReferenceCache = (key: string) => {
+    const docs: Record<string, CachedRefEntry> = {};
+    referenceRefCache.current.forEach((v, file) => {
+      if (v.ref.mode === 'file') docs[file] = { uri: v.ref.uri, mimeType: v.ref.mimeType, uploadedAt: v.uploadedAt };
+    });
+    saveRefCache(key, docs);
+  };
 
   /* ── API 키: 브라우저(localStorage)에만 저장, 서버로는 절대 안 감 ── */
   useEffect(() => {
     const saved = window.localStorage.getItem('gemini_api_key');
-    if (saved) setApiKey(saved);
+    if (saved) { setApiKey(saved); hydrateReferenceCache(saved); }
     setKeyReady(true);
   }, []);
 
   const updateApiKey = (v: string) => {
     setApiKey(v);
+    // 키가 바뀌면 이전 키로 올린 파일 참조는 다른 프로젝트 것이라 재사용 불가 — 캐시 초기화 후 새 키 기준으로 다시 로드
+    fileRefCache.current.clear();
+    hydrateReferenceCache(v);
     if (v) window.localStorage.setItem('gemini_api_key', v);
     else window.localStorage.removeItem('gemini_api_key');
   };
@@ -103,29 +131,44 @@ export default function Home() {
   const toggleType = (id: TypeId) =>
     setSelected((s) => s.includes(id) ? s.filter((x) => x !== id) : [...s, id]);
 
-  /* 첨부된 파일들을 Gemini Files API에 업로드(캐시에 없는 것만) 하고 참조 목록을 반환.
-     파일이 크거나 많을수록(예: 교육과정 41종) 여기서 시간이 걸리지만,
-     한 번 올려두면 이 탭에서는 유형×배치를 아무리 돌려도 재전송하지 않는다. */
+  /* 첨부된 파일들 + (켜져 있으면) 내장 교육과정 자료를 Gemini Files API에 업로드하고
+     참조 목록을 합쳐서 반환. 캐시에 있는 건 재업로드하지 않는다. */
   const ensureUploaded = async (): Promise<PdfRef[]> => {
     const need = files.filter((f) => !fileRefCache.current.has(f));
-    for (let i = 0; i < need.length; i++) {
-      const f = need[i];
-      setProgress(`자료 업로드 중… (${i + 1}/${need.length}) ${f.name}`);
+    const refDocs = useCurriculum ? REFERENCE_DOCS : [];
+    const needRef = refDocs.filter((d) => !referenceRefCache.current.has(d.file));
+    const totalNeed = need.length + needRef.length;
+    let done = 0;
+
+    for (const f of need) {
+      done++;
+      setProgress(`자료 업로드 중… (${done}/${totalNeed}) ${f.name}`);
       const ref = await uploadFileToGemini(apiKey, f, (msg) => setProgress(msg));
       fileRefCache.current.set(f, ref);
     }
-    return files.map((f) => fileRefCache.current.get(f)!);
+    for (const d of needRef) {
+      done++;
+      setProgress(`교육과정 자료 업로드 중… (${done}/${totalNeed}) ${d.label}`);
+      const ref = await uploadReferenceDocToGemini(apiKey, referenceDocUrl(d.file), d.label, (msg) => setProgress(msg));
+      referenceRefCache.current.set(d.file, { ref, uploadedAt: Date.now() });
+    }
+    if (needRef.length > 0) persistReferenceCache(apiKey);
+
+    const own = files.map((f) => fileRefCache.current.get(f)!);
+    const ref = refDocs.map((d) => referenceRefCache.current.get(d.file)!.ref);
+    return [...own, ...ref];
   };
 
   /* ── 생성 ── */
   const generate = async () => {
     if (!apiKey) { setError('먼저 Gemini API 키를 입력해 주세요.'); return; }
-    if (files.length === 0) { setError('먼저 교과서 PDF를 올려주세요.'); return; }
+    if (files.length === 0 && !useCurriculum) { setError('먼저 교과서 PDF를 올려주세요.'); return; }
     if (selected.length === 0) { setError('활동지 유형을 하나 이상 선택해 주세요.'); return; }
     setBusy(true); setError(''); setResults([]);
     const out: ResultEntry[] = [];
     try {
       const pdfRefs = await ensureUploaded();
+      const curriculumCount = useCurriculum ? REFERENCE_DOCS.length : 0;
       for (let i = 0; i < selected.length; i++) {
         const t = TYPES.find((x) => x.id === selected[i])!;
         const data = await generateWorksheet(
@@ -136,6 +179,7 @@ export default function Home() {
           pdfRefs,
           (s, e, total) =>
             setProgress(`${t.label} (${i + 1}/${selected.length}) — ${s}~${e}번 문항 생성 중 (전체 ${total}문항)`),
+          curriculumCount,
         );
         out.push({ typeId: selected[i], data });
         setResults([...out]);
@@ -372,6 +416,23 @@ export default function Home() {
                     <input type="checkbox" checked={useWeb} onChange={(e) => setUseWeb(e.target.checked)} />
                     <span><strong style={{ color: COLORS.blue }}>웹 자료로 보강</strong> — PDF에 없는 내용은 검색으로 확인된 것만 넣고, 출처를 문항에 표시합니다</span>
                   </label>
+                </div>
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 13, cursor: 'pointer', padding: '8px 10px', background: useCurriculum ? '#EEF7EF' : '#F6F6F3', borderRadius: 8 }}>
+                    <input type="checkbox" checked={useCurriculum} onChange={(e) => setUseCurriculum(e.target.checked)} style={{ marginTop: 2 }} />
+                    <span>
+                      <strong style={{ color: COLORS.green }}>2022 개정 교육과정 자료 함께 사용</strong> — 총론·교과별 교육과정 {REFERENCE_DOCS.length}종이 내장돼 있어요. 켜면 업로드한 교과서와 함께 근거로 사용됩니다 (교과서 없이 이 옵션만 켜도 생성 가능).
+                      <div style={{ fontSize: 11.5, color: COLORS.sub, marginTop: 3 }}>처음 켤 때 시간이 좀 걸려요 (자료 {REFERENCE_DOCS.length}개를 올리는 중) — 자세한 동작 방식은 아래 안내 참고.</div>
+                    </span>
+                  </label>
+                  <details style={{ marginTop: 6, fontSize: 12, color: COLORS.sub }}>
+                    <summary style={{ cursor: 'pointer', fontWeight: 600, color: COLORS.ink }}>이 자료들, 어디로 어떻게 올라가나요?</summary>
+                    <ul style={{ margin: '6px 0 0', paddingLeft: 18, lineHeight: 1.7 }}>
+                      <li>이 옵션을 켜면 브라우저가 위에 입력한 <b>내 Gemini API 키가 연결된 구글 프로젝트</b>로 자료를 올려요. MK님(사이트 제작자)이나 다른 사람 계정으로 가는 게 아니라, 딱 <b>내 키의 프로젝트에만</b> 올라가요.</li>
+                      <li>이렇게 올라간 파일은 사람이 로그인해서 보는 "내 파일함" 같은 게 아니라, AI가 문항을 만들 때 참고하는 임시 자료예요. 구글 정책상 <b>48시간 뒤 자동 삭제</b>돼요.</li>
+                      <li>매번 새로 올리면 느리니까, 올린 기록을 이 <b>브라우저에 저장</b>해뒀다가 48시간 안에 다시 오면 재사용해요 — 탭을 닫았다 열어도 마찬가지예요. 48시간이 지났거나 API 키를 바꾸면 다시 올라가요.</li>
+                    </ul>
+                  </details>
                 </div>
               </div>
             </div>
